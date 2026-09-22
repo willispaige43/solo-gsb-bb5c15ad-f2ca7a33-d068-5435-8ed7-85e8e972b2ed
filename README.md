@@ -6,6 +6,10 @@
 若干条事实，并附带 Merkle 包含证明；验证方**完全不需要原始文档**，仅凭「根 + 所选值 +
 证明」即可校验，且任何对路径、值或兄弟哈希的篡改都会导致根不匹配，错误带有精确定位。
 
+此外，`POST /diff` 复用同一套叶展开与规范 JSON 规则，对两份文档做**叶级变更报告**：
+排序对齐两边路径集合，输出 `added` / `removed` / `changed` 三组，逐项给出路径、
+旧值/新值（缺失侧为 `null`）及对应规范值的 SHA-256 指纹。
+
 ## 一条命令启动
 
 ```bash
@@ -295,6 +299,90 @@ leaf_digest = SHA256(
 } }
 ```
 
+### `POST /diff` — 叶级变更报告
+
+对 `before` / `after` 两份文档按**同一套叶展开与规范 JSON 规则**求差：
+两边各自展开为叶集合后按路径排序对齐——仅在一侧出现的路径进入
+`added` / `removed`，两侧都有但**规范值字节不同**的路径进入 `changed`
+（因此 `1`、`1.0`、`true` 是三个不同的值，对象键顺序差异不算变更）。
+每一项给出路径、旧值/新值（缺失侧为 `null`）及对应**规范值的
+SHA-256 指纹**（缺失侧指纹为 `null`）。
+
+请求：
+
+```json
+{
+  "before": {
+    "subject": { "name": "Ada", "age": 36, "nickname": null },
+    "emails": ["ada@example.com"]
+  },
+  "after": {
+    "subject": { "name": "Ada", "age": 37 },
+    "emails": ["ada@example.com", "ada@analytical.engine"]
+  }
+}
+```
+
+响应（三组各自按路径排序，结果稳定）：
+
+```json
+{
+  "added": [
+    { "path": "/emails/1", "before": null, "after": "ada@analytical.engine",
+      "beforeFingerprint": null,
+      "afterFingerprint": "5464e34d42387f6d4ee7d05d02b24630defa16810e46852fdda79bf92f3707f7" }
+  ],
+  "removed": [
+    { "path": "/subject/nickname", "before": null, "after": null,
+      "beforeFingerprint": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
+      "afterFingerprint": null }
+  ],
+  "changed": [
+    { "path": "/subject/age", "before": 36, "after": 37,
+      "beforeFingerprint": "76a50887d8f1c2e9301755428990ad81479ee21c25b43215cf524541e0503269",
+      "afterFingerprint": "7a61b53701befdae0eeeffaecc73f14e20b537bb0f8b91ad7c2936dc63562b25" }
+  ]
+}
+```
+
+注意上例 `removed` 中的 `/subject/nickname`：它在 `before` 里的值本身就是
+JSON `null`，因此 `before` 为 `null` 但 `beforeFingerprint` **存在**
+（`SHA256("null")`）；而缺失侧（`after`）的值与指纹**都为 `null`**。
+指纹正是区分「值为 null」与「该侧不存在」的依据。
+
+语义要点：
+
+- 叶规则与 `/commit` 完全一致：标量、`null`、空容器是叶子；根标量/空文档
+  落在根路径 `""`（如 `{}` → `[]` 是 `changed` 中 `path: ""` 的一项）；
+- 叶子在某侧变成非空容器（或反向）时，表现为旧叶 `removed` + 新叶 `added`，
+  而不是 `changed`；
+- 可选 `"paths": [...]` 过滤器只接受**精确叶路径**（在任一文档中是叶即可），
+  只缩小报告范围、不改变排序；指向未变更叶的路径合法但不产生条目；
+- 过滤器中重复路径、非叶路径（`detail.leafChildren` 列出可选叶）、
+  两侧都不存在的路径、指针语法错误都会使**整个请求失败**并返回带
+  `loc`（如 `paths[1]`）的统一错误体；`before`/`after` 任一非法同样整体失败。
+
+过滤请求示例：
+
+```json
+{
+  "before": { "a": 1, "b": { "c": 2 } },
+  "after":  { "a": 2, "b": { "c": 2, "d": 3 } },
+  "paths": ["/a", "/b/d"]
+}
+```
+
+错误示例（`/b` 指向非空对象而非叶子）：
+
+```json
+{ "error": {
+    "code": "PATH_NOT_LEAF",
+    "message": "path '/b' is a non-empty object, not a leaf; the filter only accepts exact leaf paths",
+    "loc": "paths[0]",
+    "detail": { "path": "/b", "leafChildren": ["/b/c"] }
+} }
+```
+
 ### 错误码一览
 
 | HTTP | code | 触发场景（示例） |
@@ -302,10 +390,10 @@ leaf_digest = SHA256(
 | 400 | `INVALID_JSON` | 请求体不是合法 JSON、含重复对象键 |
 | 400 | `INVALID_REQUEST` | 缺字段、类型错误 |
 | 400 | `POINTER_SYNTAX` | 指针非法（如尾随 `~`、不以 `/` 开头） |
-| 400 | `PATH_NOT_FOUND` | 文档中不存在该路径（含数组越界） |
+| 400 | `PATH_NOT_FOUND` | 文档中不存在该路径（含数组越界；`/diff` 中为两侧都不存在的过滤路径） |
 | 400 | `PATH_NOT_LEAF` | 路径是非空容器；`detail.leafChildren` 给出可选的叶路径 |
-| 400 | `DUPLICATE_PATH` | 同一指针重复提交 |
-| 400 | `EMPTY_REVEAL` | 披露列表为空 |
+| 400 | `DUPLICATE_PATH` | 同一指针重复提交（`reveal`、`leaves` 或 `/diff` 的 `paths`） |
+| 400 | `EMPTY_REVEAL` | 披露列表或 `/diff` 的 `paths` 过滤器为空 |
 | 400 | `UNSUPPORTED_VALUE` | `NaN`/`Infinity`、孤立代理项等 |
 | 400 | `BAD_HASH_ENCODING` | 根或兄弟哈希不是 64 位十六进制 |
 | 400 | `BAD_PROOF` | 证明结构错误：标准格式 side 非法、兄弟长度不对；紧凑格式叶/节点下标越界或重复、节点缺失或多余、携带奇数层末节点等（均有精确 `loc`） |
@@ -342,13 +430,20 @@ curl -s localhost:8000/commit -H 'content-type: application/json' -d '{
 }'
 # /verify 自动识别紧凑格式：把紧凑响应的 root/leafCount/leaves/proofNodes
 # 原样回传即可（无需携带 document 或 proofMode）。
+
+# 5) 叶级 diff：两组变更 + 可选 paths 过滤，逐项带规范值 SHA-256 指纹
+curl -s localhost:8000/diff -H 'content-type: application/json' -d '{
+  "before": {"subject": {"age": 36}, "emails": ["a@x"]},
+  "after":  {"subject": {"age": 37}, "emails": ["a@x", "b@y"]},
+  "paths": ["/subject/age", "/emails/1"]
+}'
 ```
 
 ## 本地开发与测试（不使用 Docker）
 
 ```bash
 python3 -m pip install -r requirements-dev.txt
-python3 -m pytest -q          # 69 个测试
+python3 -m pytest -q          # 95 个测试
 python3 -m uvicorn app.main:app --reload --port 8000
 ```
 
@@ -356,15 +451,15 @@ python3 -m uvicorn app.main:app --reload --port 8000
 
 ```
 app/
-  main.py        # FastAPI 路由：/commit、/verify、错误处理
+  main.py        # FastAPI 路由：/commit、/verify、/diff、错误处理
   tree.py        # 叶展开、叶哈希/节点哈希、排序建树、标准与紧凑证明
   pointers.py    # RFC 6901 指针解析与寻址
   canonical.py   # 规范 JSON 序列化
   jsonio.py      # 严格 JSON 解析（拒绝重复键、错误定位）
   validation.py  # 提交值校验（非有限数、非 JSON 类型等）
-  openapi.py     # 两种证明格式的 OpenAPI 模型与文档合并
+  openapi.py     # 两种证明格式与 /diff 的 OpenAPI 模型与文档合并
   errors.py      # 带 code/loc 的 API 错误类型
-tests/           # 哈希/树单元测试 + API 端到端（含全部篡改、去重与结构错误场景）
+tests/           # 哈希/树单元测试 + API 端到端（含全部篡改、去重、结构错误与 diff 场景）
 Dockerfile
 docker-entrypoint.sh   # 启动时安装依赖并启动 uvicorn
 docker-compose.yml

@@ -721,3 +721,270 @@ def test_compact_randomized_roundtrips(seed):
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["valid"] is True
+
+
+# ---------------------------------------------------------------------------
+# POST /diff — leaf-level change reports
+# ---------------------------------------------------------------------------
+
+
+import hashlib
+
+from app.canonical import canonical_scalar_bytes
+
+
+def _fp(value):
+    """Expected fingerprint: SHA-256 of the canonical leaf value."""
+    return hashlib.sha256(canonical_scalar_bytes(value)).hexdigest()
+
+
+def _diff(before, after, paths=None):
+    payload = {"before": before, "after": after}
+    if paths is not None:
+        payload["paths"] = paths
+    return client.post("/diff", json=payload)
+
+
+BEFORE = {
+    "subject": {"name": "Ada", "age": 36, "nickname": None},
+    "emails": ["ada@example.com"],
+    "empty": {},
+    "same": "keep",
+}
+AFTER = {
+    "subject": {"name": "Ada", "age": 37},
+    "emails": ["ada@example.com", "ada@analytical.engine"],
+    "empty": {},
+    "same": "keep",
+    "fresh": [True],
+}
+
+
+def test_diff_groups_sorted_with_values_and_fingerprints():
+    resp = _diff(BEFORE, AFTER)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert set(data.keys()) == {"added", "removed", "changed"}
+
+    added = {e["path"]: e for e in data["added"]}
+    removed = {e["path"]: e for e in data["removed"]}
+    changed = {e["path"]: e for e in data["changed"]}
+    assert set(added) == {"/emails/1", "/fresh/0"}
+    assert set(removed) == {"/subject/nickname"}
+    assert set(changed) == {"/subject/age"}
+
+    # Every group is sorted by pointer (Unicode code point order).
+    for group in data.values():
+        paths = [e["path"] for e in group]
+        assert paths == sorted(paths)
+
+    # Added: missing before side is null on both value and fingerprint.
+    entry = added["/emails/1"]
+    assert entry["before"] is None
+    assert entry["beforeFingerprint"] is None
+    assert entry["after"] == "ada@analytical.engine"
+    assert entry["afterFingerprint"] == _fp("ada@analytical.engine")
+    assert added["/fresh/0"]["after"] is True
+    assert added["/fresh/0"]["afterFingerprint"] == _fp(True)
+
+    # Removed leaf held a real JSON null: the value side is null but the
+    # fingerprint is present — that is how null differs from "missing".
+    entry = removed["/subject/nickname"]
+    assert entry["before"] is None
+    assert entry["beforeFingerprint"] == _fp(None)
+    assert entry["after"] is None
+    assert entry["afterFingerprint"] is None
+
+    # Changed: both sides carry value + fingerprint.
+    entry = changed["/subject/age"]
+    assert (entry["before"], entry["after"]) == (36, 37)
+    assert entry["beforeFingerprint"] == _fp(36)
+    assert entry["afterFingerprint"] == _fp(37)
+
+    # Untouched leaves (incl. the empty object) are not reported.
+    reported = set(added) | set(removed) | set(changed)
+    assert "/same" not in reported and "/empty" not in reported
+
+
+def test_diff_identical_documents_report_nothing():
+    data = _diff(BEFORE, copy.deepcopy(BEFORE)).json()
+    assert data == {"added": [], "removed": [], "changed": []}
+
+
+def test_diff_compares_canonical_values_not_python_equality():
+    # 1 == 1.0 == True in Python, but their canonical forms differ.
+    data = _diff({"n": 1, "b": True}, {"n": 1.0, "b": 1}).json()
+    assert [e["path"] for e in data["changed"]] == ["/b", "/n"]
+    # Object member order is insignificant under the canonical rules.
+    data = _diff({"o": {"x": 1, "y": 2}}, {"o": {"y": 2, "x": 1}}).json()
+    assert data == {"added": [], "removed": [], "changed": []}
+
+
+def test_diff_root_scalars_and_empty_documents():
+    # Root scalar vs root scalar: the root leaf "" changes.
+    data = _diff(42, "42").json()
+    assert data["changed"] == [
+        {
+            "path": "",
+            "before": 42,
+            "after": "42",
+            "beforeFingerprint": _fp(42),
+            "afterFingerprint": _fp("42"),
+        }
+    ]
+    # Empty documents are leaves at the root; {} and [] canonicalize
+    # differently, so this is a change, not an add/remove pair.
+    data = _diff({}, []).json()
+    assert [e["path"] for e in data["changed"]] == [""]
+    assert data["changed"][0]["before"] == {}
+    assert data["changed"][0]["after"] == []
+    # Identical empty documents have no diff; null document vs null too.
+    assert _diff({}, {}).json() == {"added": [], "removed": [], "changed": []}
+    assert _diff(None, None).json() == {"added": [], "removed": [], "changed": []}
+    # Empty root object vs nested content: root leaf removed, leaves added.
+    data = _diff({}, {"a": 1}).json()
+    assert [e["path"] for e in data["removed"]] == [""]
+    assert [e["path"] for e in data["added"]] == ["/a"]
+
+
+def test_diff_leaf_container_shift_is_remove_plus_add():
+    data = _diff({"a": 1}, {"a": {"b": 2}}).json()
+    assert [e["path"] for e in data["removed"]] == ["/a"]
+    assert [e["path"] for e in data["added"]] == ["/a/b"]
+    assert data["changed"] == []
+
+
+def test_diff_filter_restricts_all_groups():
+    resp = _diff(
+        BEFORE, AFTER, paths=["/subject/age", "/emails/1", "/same"]
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert [e["path"] for e in data["changed"]] == ["/subject/age"]
+    assert [e["path"] for e in data["added"]] == ["/emails/1"]
+    assert data["removed"] == []  # /subject/nickname not selected
+    # "/same" is a valid leaf filter but unchanged, so it is not reported.
+
+
+def test_diff_filter_accepts_path_that_is_leaf_on_either_side():
+    # /a is a leaf in before but a container in after; /a/b only in after.
+    resp = _diff({"a": 1}, {"a": {"b": 2}}, paths=["/a", "/a/b"])
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert [e["path"] for e in data["removed"]] == ["/a"]
+    assert [e["path"] for e in data["added"]] == ["/a/b"]
+
+
+def test_diff_filter_escaped_pointer_tokens():
+    resp = _diff(
+        {"a/b": {"tilde~key": 1}},
+        {"a/b": {"tilde~key": 2}},
+        paths=["/a~1b/tilde~0key"],
+    )
+    assert resp.status_code == 200, resp.text
+    assert [e["path"] for e in resp.json()["changed"]] == ["/a~1b/tilde~0key"]
+
+
+def test_diff_filter_duplicate_path():
+    resp = _diff(BEFORE, AFTER, paths=["/same", "/same"])
+    assert resp.status_code == 400
+    err = resp.json()["error"]
+    assert err["code"] == "DUPLICATE_PATH"
+    assert err["loc"] == "paths[1]"
+    assert err["detail"]["path"] == "/same"
+
+
+def test_diff_filter_non_leaf_path_located():
+    resp = _diff(BEFORE, AFTER, paths=["/subject"])
+    assert resp.status_code == 400
+    err = resp.json()["error"]
+    assert err["code"] == "PATH_NOT_LEAF"
+    assert err["loc"] == "paths[0]"
+    assert "/subject/age" in err["detail"]["leafChildren"]
+
+    # A path that is a container only in the *after* document is located too.
+    resp = _diff({"a": 1}, {"a": {"b": 2}}, paths=["/a", "/a"])
+    assert resp.status_code == 400  # duplicate caught first
+    resp = _diff({"a": {"b": 1}}, {"a": 2}, paths=["/a/b", "/a"])
+    assert resp.status_code == 200  # /a/b leaf in before, /a leaf in after
+
+
+def test_diff_filter_unknown_path():
+    resp = _diff(BEFORE, AFTER, paths=["/subject/height"])
+    assert resp.status_code == 400
+    err = resp.json()["error"]
+    assert err["code"] == "PATH_NOT_FOUND"
+    assert err["loc"] == "paths[0]"
+
+    resp = _diff(BEFORE, AFTER, paths=["/emails/9"])
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "PATH_NOT_FOUND"
+
+
+def test_diff_filter_shape_and_syntax_errors():
+    resp = _diff(BEFORE, AFTER, paths=[])
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "EMPTY_REVEAL"
+    assert resp.json()["error"]["loc"] == "paths"
+
+    resp = _diff(BEFORE, AFTER, paths="/same")
+    assert resp.status_code == 400
+    err = resp.json()["error"]
+    assert err["code"] == "INVALID_REQUEST"
+    assert err["loc"] == "paths"
+
+    resp = _diff(BEFORE, AFTER, paths=["/same", 7])
+    assert resp.status_code == 400
+    assert resp.json()["error"]["loc"] == "paths[1]"
+
+    resp = _diff(BEFORE, AFTER, paths=["subject"])
+    assert resp.status_code == 400
+    err = resp.json()["error"]
+    assert err["code"] == "POINTER_SYNTAX"
+    assert err["loc"] == "paths[0]"
+
+
+def test_diff_request_validation_errors():
+    resp = client.post("/diff", json={"after": AFTER})
+    assert resp.status_code == 400
+    assert resp.json()["error"]["loc"] == "before"
+
+    resp = client.post("/diff", json={"before": BEFORE})
+    assert resp.status_code == 400
+    assert resp.json()["error"]["loc"] == "after"
+
+    resp = client.post("/diff", json=[1, 2])
+    assert resp.status_code == 400
+    assert resp.json()["error"]["loc"] == "body"
+
+    resp = client.post(
+        "/diff", content=b'{"before": {"a": 1},', headers={}
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "INVALID_JSON"
+
+    # NaN parses under Python's decoder but is not a valid JSON value.
+    resp = client.post(
+        "/diff",
+        content=b'{"before": NaN, "after": 1}',
+        headers={"content-type": "application/json"},
+    )
+    assert resp.status_code == 400
+    err = resp.json()["error"]
+    assert err["code"] == "UNSUPPORTED_VALUE"
+    assert err["loc"] == "before"
+
+
+def test_diff_sorting_uses_unicode_code_point_order():
+    before = {"b": 1, "A": 2, "a": 3, "é": 4}
+    after = {"b": 10, "A": 20, "a": 30, "é": 40}
+    data = _diff(before, after).json()
+    assert [e["path"] for e in data["changed"]] == ["/A", "/a", "/b", "/é"]
+
+
+def test_diff_openapi_and_index_advertise_the_endpoint():
+    spec = client.get("/openapi.json").json()
+    assert "/diff" in spec["paths"]
+    assert "DiffRequest" in spec["components"]["schemas"]
+    info = client.get("/").json()
+    assert info["endpoints"]["diff"] == "POST /diff"

@@ -1,4 +1,4 @@
-"""Hand-written OpenAPI surface for the /commit and /verify endpoints.
+"""Hand-written OpenAPI surface for the /commit, /verify and /diff endpoints.
 
 Both routes deliberately accept a raw JSON :class:`fastapi.Request` (so they
 can return the documented precise ``loc`` errors instead of Pydantic 422s),
@@ -158,6 +158,74 @@ class CompactVerifyRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Leaf-level document diff
+# ---------------------------------------------------------------------------
+
+
+class DiffRequest(BaseModel):
+    before: Any = Field(..., description="The original JSON document.")
+    after: Any = Field(..., description="The updated JSON document.")
+    paths: Optional[List[str]] = Field(
+        None,
+        description=(
+            "Optional filter: restrict the report to these RFC 6901 leaf "
+            "paths.  Every entry must name an exact leaf in at least one of "
+            "the two documents; duplicates, non-leaf paths and unknown "
+            "paths are rejected with a precise `loc`."
+        ),
+    )
+
+
+class DiffEntry(BaseModel):
+    path: str = Field(..., description="RFC 6901 pointer of the leaf.")
+    before: Any = Field(
+        None,
+        description=(
+            "Leaf value in the `before` document; null when the leaf does "
+            "not exist there.  A genuine JSON null also serializes as null "
+            "— use `beforeFingerprint` to tell the two apart."
+        ),
+    )
+    after: Any = Field(
+        None,
+        description=(
+            "Leaf value in the `after` document; null when the leaf does "
+            "not exist there (see `beforeFingerprint`)."
+        ),
+    )
+    beforeFingerprint: Optional[str] = Field(
+        None,
+        pattern=r"^[0-9a-f]{64}$",
+        description=(
+            "SHA-256 of the canonical `before` value; null when the leaf "
+            "is absent from the `before` document."
+        ),
+    )
+    afterFingerprint: Optional[str] = Field(
+        None,
+        pattern=r"^[0-9a-f]{64}$",
+        description=(
+            "SHA-256 of the canonical `after` value; null when the leaf "
+            "is absent from the `after` document."
+        ),
+    )
+
+
+class DiffResponse(BaseModel):
+    added: List[DiffEntry] = Field(
+        ..., description="Leaves present only in `after`, sorted by path."
+    )
+    removed: List[DiffEntry] = Field(
+        ..., description="Leaves present only in `before`, sorted by path."
+    )
+    changed: List[DiffEntry] = Field(
+        ...,
+        description="Leaves present in both whose canonical value differs, "
+        "sorted by path.",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Shared responses / errors
 # ---------------------------------------------------------------------------
 
@@ -242,6 +310,9 @@ def install_openapi(app: FastAPI) -> None:
                 CompactVerifyRequest,
                 StandardVerifyResponse,
                 CompactVerifyResponse,
+                DiffRequest,
+                DiffEntry,
+                DiffResponse,
                 ErrorResponse,
             )
         )
@@ -377,6 +448,89 @@ def install_openapi(app: FastAPI) -> None:
                         **_json_content(verify_response_schema),
                     },
                     **error_responses,
+                },
+            }
+        }
+
+        generated["paths"]["/diff"] = {
+            "post": {
+                "summary": "Report leaf-level changes between two documents",
+                "description": (
+                    "Expands `before` and `after` into RFC 6901 leaves with "
+                    "the same rules as /commit (scalars, null and empty "
+                    "containers are leaves; a scalar or empty root document "
+                    "is the single root leaf `\"\"`), aligns the two sorted "
+                    "path sets and reports `added`, `removed` and `changed` "
+                    "groups.  Each entry carries the path, the old/new "
+                    "value (null on the missing side) and the SHA-256 "
+                    "fingerprint of the corresponding canonical value.  "
+                    "Values are compared by canonical form, so 1, 1.0 and "
+                    "true are three different values.  The optional `paths` "
+                    "filter narrows the report to exact leaf paths; "
+                    "duplicates, non-leaf paths and unknown paths fail the "
+                    "whole request with a locatable 400 error."
+                ),
+                "operationId": "diff",
+                "requestBody": _json_content(
+                    _ref("DiffRequest"),
+                    example={
+                        "before": {
+                            "subject": {"name": "Ada", "age": 36},
+                            "emails": ["ada@example.com"],
+                            "nickname": None,
+                        },
+                        "after": {
+                            "subject": {"name": "Ada", "age": 37},
+                            "emails": ["ada@example.com",
+                                       "ada@analytical.engine"],
+                        },
+                        "paths": ["/subject/age", "/emails/1", "/nickname"],
+                    },
+                ),
+                "responses": {
+                    "200": {
+                        "description": "Sorted added/removed/changed leaf "
+                        "groups",
+                        **_json_content(
+                            _ref("DiffResponse"),
+                            example={
+                                "added": [
+                                    {
+                                        "path": "/emails/1",
+                                        "before": None,
+                                        "after": "ada@analytical.engine",
+                                        "beforeFingerprint": None,
+                                        "afterFingerprint": "ab" * 32,
+                                    }
+                                ],
+                                "removed": [
+                                    {
+                                        "path": "/nickname",
+                                        "before": None,
+                                        "after": None,
+                                        "beforeFingerprint": "cd" * 32,
+                                        "afterFingerprint": None,
+                                    }
+                                ],
+                                "changed": [
+                                    {
+                                        "path": "/subject/age",
+                                        "before": 36,
+                                        "after": 37,
+                                        "beforeFingerprint": "ef" * 32,
+                                        "afterFingerprint": "09" * 32,
+                                    }
+                                ],
+                            },
+                        ),
+                    },
+                    "400": {"description": "Structural/input error "
+                            "(INVALID_REQUEST, POINTER_SYNTAX, "
+                            "PATH_NOT_LEAF, DUPLICATE_PATH, ...)",
+                            **_json_content(_ref("ErrorResponse"))},
+                    "413": {"description": "Request body exceeds "
+                            "MAX_BODY_BYTES",
+                            **_json_content(_ref("ErrorResponse"))},
                 },
             }
         }

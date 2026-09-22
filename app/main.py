@@ -1,4 +1,4 @@
-"""FastAPI application: commit-and-prove and stateless verification.
+"""FastAPI application: commit-and-prove, stateless verification and diffs.
 
 Endpoints
 ----------
@@ -10,21 +10,28 @@ POST /commit   submit a nested JSON document plus the RFC 6901 paths that
 POST /verify   check disclosures against a previously committed root without
                ever seeing the original document; both proof formats are
                detected automatically.
+POST /diff     report the leaf-level changes between two nested JSON
+               documents as sorted added/removed/changed groups, each entry
+               carrying the old/new value (null on the missing side) and the
+               SHA-256 fingerprint of the corresponding canonical value;
+               an optional "paths" filter restricts the report to exact
+               leaf paths.
 GET  /healthz  liveness probe.
 GET  /         service metadata.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from . import pointers
-from .canonical import CanonicalError
+from .canonical import CanonicalError, canonical_scalar_bytes
 from .errors import (
     ApiError,
     BAD_HASH_ENCODING,
@@ -42,6 +49,7 @@ from .jsonio import parse_json_strict
 from .openapi import install_openapi
 from .tree import (
     CompactNode,
+    Leaf,
     ProofStep,
     TreeError,
     compact_proof_nodes,
@@ -71,7 +79,7 @@ _HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
 
 app = FastAPI(
     title="Selective JSON Disclosure",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "Commit a nested JSON document to a reproducible Merkle root and "
         "disclose individual RFC 6901 leaf facts with inclusion proofs.\n\n"
@@ -80,7 +88,10 @@ app = FastAPI(
         "shared multi-leaf proof in which every sibling tree node is named "
         "exactly once by `{level, index, hash}` and each disclosed leaf "
         "carries only its sorted leaf index. `/verify` detects the format "
-        "automatically."
+        "automatically.\n\n"
+        "`/diff` compares two documents leaf-by-leaf and reports the "
+        "sorted `added`/`removed`/`changed` paths with canonical-value "
+        "SHA-256 fingerprints."
     ),
 )
 
@@ -789,6 +800,196 @@ async def verify(request: Request) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# POST /diff
+# ---------------------------------------------------------------------------
+
+
+def _validate_diff_filter(
+    raw_paths: Any,
+    before: Any,
+    after: Any,
+    before_leaves: Dict[str, Leaf],
+    after_leaves: Dict[str, Leaf],
+    before_pointers: List[str],
+    after_pointers: List[str],
+) -> Set[str]:
+    """Validate the optional ``paths`` filter and return it as a set.
+
+    Every entry must be an RFC 6901 pointer that names an *exact leaf* in at
+    least one of the two documents.  Duplicates, syntax errors, paths that
+    resolve to a non-empty container and paths that exist in neither
+    document are rejected with a precise ``loc``.
+    """
+    if not isinstance(raw_paths, list):
+        raise ApiError(
+            INVALID_REQUEST,
+            "'paths' must be an array of RFC 6901 pointer strings",
+            loc="paths",
+        )
+    if len(raw_paths) == 0:
+        raise ApiError(
+            EMPTY_REVEAL,
+            "'paths' must contain at least one RFC 6901 path",
+            loc="paths",
+        )
+
+    selected: Set[str] = set()
+    for i, requested in enumerate(raw_paths):
+        loc = f"paths[{i}]"
+        if not isinstance(requested, str):
+            raise ApiError(
+                INVALID_REQUEST,
+                f"paths entry must be a pointer string, got "
+                f"{type(requested).__name__}",
+                loc=loc,
+            )
+        try:
+            tokens = pointers.parse_pointer(requested)
+        except pointers.PointerError as exc:
+            raise ApiError(POINTER_SYNTAX, str(exc), loc=loc) from exc
+
+        if requested in selected:
+            raise ApiError(
+                DUPLICATE_PATH,
+                f"path {requested!r} appears more than once in 'paths'",
+                loc=loc,
+                detail={"path": requested},
+            )
+
+        if requested in before_leaves or requested in after_leaves:
+            selected.add(requested)
+            continue
+
+        # Not a leaf in either document: locate the offending side.  A path
+        # that resolves to a non-empty container is PATH_NOT_LEAF; a path
+        # that resolves nowhere is PATH_NOT_FOUND.
+        for doc, leaf_pointers in (
+            (before, before_pointers),
+            (after, after_pointers),
+        ):
+            try:
+                resolved = pointers.resolve(doc, tokens)
+            except (KeyError, IndexError, TypeError):
+                continue
+            if isinstance(resolved, (dict, list)) and len(resolved) > 0:
+                prefix = requested + "/"
+                children = [
+                    pointer
+                    for pointer in leaf_pointers
+                    if pointer.startswith(prefix)
+                ][:20]
+                raise ApiError(
+                    PATH_NOT_LEAF,
+                    f"path {requested!r} is a non-empty "
+                    f"{'object' if isinstance(resolved, dict) else 'array'}, "
+                    "not a leaf; the filter only accepts exact leaf paths",
+                    loc=loc,
+                    detail={"path": requested, "leafChildren": children},
+                )
+        raise ApiError(
+            PATH_NOT_FOUND,
+            f"path {requested!r} is not a leaf in either document",
+            loc=loc,
+            detail={"path": requested},
+        )
+    return selected
+
+
+@app.post("/diff")
+async def diff(request: Request) -> Dict[str, Any]:
+    body = await _read_json_body(request)
+    if not isinstance(body, dict):
+        raise ApiError(
+            INVALID_REQUEST,
+            "request body must be a JSON object",
+            loc="body",
+        )
+
+    before = _get_field(body, "before", "before")
+    validate_json_value(before, loc="before")
+    after = _get_field(body, "after", "after")
+    validate_json_value(after, loc="after")
+
+    # Expand both documents with the same leaf rules as /commit: scalars,
+    # null and empty containers are leaves; a scalar/empty root document
+    # yields the single root leaf "".
+    before_leaf_list = expand_leaves(before)
+    after_leaf_list = expand_leaves(after)
+    before_leaves = {leaf.pointer: leaf for leaf in before_leaf_list}
+    after_leaves = {leaf.pointer: leaf for leaf in after_leaf_list}
+
+    selected: Optional[Set[str]] = None
+    if "paths" in body:
+        selected = _validate_diff_filter(
+            body["paths"],
+            before,
+            after,
+            before_leaves,
+            after_leaves,
+            [leaf.pointer for leaf in before_leaf_list],
+            [leaf.pointer for leaf in after_leaf_list],
+        )
+
+    # Canonical bytes decide both "changed" (1 vs 1.0 vs true differ) and
+    # the SHA-256 fingerprints reported for each side.
+    before_canonical = {
+        pointer: canonical_scalar_bytes(leaf.value)
+        for pointer, leaf in before_leaves.items()
+    }
+    after_canonical = {
+        pointer: canonical_scalar_bytes(leaf.value)
+        for pointer, leaf in after_leaves.items()
+    }
+
+    before_paths = set(before_leaves)
+    after_paths = set(after_leaves)
+
+    def _aligned(paths: Set[str]) -> List[str]:
+        # Sorted-pointer order keeps the response stable; the optional
+        # filter only narrows the reported set, never reorders it.
+        if selected is not None:
+            paths = paths & selected
+        return sorted(paths)
+
+    added_paths = _aligned(after_paths - before_paths)
+    removed_paths = _aligned(before_paths - after_paths)
+    changed_paths = _aligned(
+        {
+            pointer
+            for pointer in before_paths & after_paths
+            if before_canonical[pointer] != after_canonical[pointer]
+        }
+    )
+
+    def _entry(pointer: str) -> Dict[str, Any]:
+        before_leaf = before_leaves.get(pointer)
+        after_leaf = after_leaves.get(pointer)
+        return {
+            "path": pointer,
+            "before": before_leaf.value if before_leaf is not None else None,
+            "after": after_leaf.value if after_leaf is not None else None,
+            # A missing side has no canonical value, hence no fingerprint;
+            # a real JSON null hashes like any other value.
+            "beforeFingerprint": (
+                hashlib.sha256(before_canonical[pointer]).hexdigest()
+                if before_leaf is not None
+                else None
+            ),
+            "afterFingerprint": (
+                hashlib.sha256(after_canonical[pointer]).hexdigest()
+                if after_leaf is not None
+                else None
+            ),
+        }
+
+    return {
+        "added": [_entry(pointer) for pointer in added_paths],
+        "removed": [_entry(pointer) for pointer in removed_paths],
+        "changed": [_entry(pointer) for pointer in changed_paths],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Meta
 # ---------------------------------------------------------------------------
 
@@ -802,10 +1003,11 @@ async def healthz() -> Dict[str, str]:
 async def index() -> Dict[str, Any]:
     return {
         "service": "selective-json-disclosure",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "endpoints": {
             "commit": "POST /commit",
             "verify": "POST /verify",
+            "diff": "POST /diff",
             "docs": "GET /docs",
             "health": "GET /healthz",
         },
