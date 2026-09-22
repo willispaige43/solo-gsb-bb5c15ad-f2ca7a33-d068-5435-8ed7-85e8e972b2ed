@@ -173,6 +173,58 @@ class StandardVerifyResponse(BaseModel):
     leaves: List[VerifiedLeaf]
 
 
+# ---------------------------------------------------------------------------
+# Leaf-level document diff
+# ---------------------------------------------------------------------------
+
+
+class DiffRequest(BaseModel):
+    before: Any = Field(..., description="The original JSON document.")
+    after: Any = Field(..., description="The new JSON document.")
+    paths: Optional[List[str]] = Field(
+        None,
+        description=(
+            "Optional exact RFC 6901 leaf paths to compare. Omit to compare "
+            "the union of all leaves; every entry must be a leaf in at least "
+            "one document and duplicates/non-leaf paths are rejected."
+        ),
+    )
+
+
+class DiffEntry(BaseModel):
+    path: str = Field(..., description="RFC 6901 pointer of the changed leaf.")
+    beforeValue: Optional[Any] = Field(
+        None, description="Leaf value in `before`; null means absent."
+    )
+    afterValue: Optional[Any] = Field(
+        None, description="Leaf value in `after`; null means absent."
+    )
+    beforeFingerprint: Optional[str] = Field(
+        None,
+        description="SHA-256 hex fingerprint of canonical `beforeValue`; "
+        "null means the path was absent.",
+    )
+    afterFingerprint: Optional[str] = Field(
+        None,
+        description="SHA-256 hex fingerprint of canonical `afterValue`; "
+        "null means the path was absent.",
+    )
+
+
+class DiffResponse(BaseModel):
+    added: List[DiffEntry] = Field(
+        ..., description="Leaf paths present only in `after`, sorted by path."
+    )
+    removed: List[DiffEntry] = Field(
+        ..., description="Leaf paths present only in `before`, sorted by path."
+    )
+    changed: List[DiffEntry] = Field(
+        ...,
+        description="Leaf paths present on both sides whose canonical values "
+        "differ, sorted by path.",
+    )
+
+
 class CompactVerifyResponse(StandardVerifyResponse):
     proofMode: Literal["compact"]
 
@@ -242,6 +294,8 @@ def install_openapi(app: FastAPI) -> None:
                 CompactVerifyRequest,
                 StandardVerifyResponse,
                 CompactVerifyResponse,
+                DiffRequest,
+                DiffResponse,
                 ErrorResponse,
             )
         )
@@ -375,6 +429,90 @@ def install_openapi(app: FastAPI) -> None:
                         "description": "All disclosures rebuild the committed "
                         "root",
                         **_json_content(verify_response_schema),
+                    },
+                    **error_responses,
+                },
+            }
+        }
+
+        generated["paths"]["/diff"] = {
+            "post": {
+                "summary": "Report leaf-level differences between two documents",
+                "description": (
+                    "Expands both documents using the same RFC 6901 leaf "
+                    "rules as /commit (scalars, null and empty containers "
+                    "are leaves), aligns sorted leaf paths and returns added, "
+                    "removed and changed entries. Each entry includes both "
+                    "values (null on the absent side) and SHA-256 "
+                    "fingerprints of the canonical value bytes. An optional "
+                    "paths array permits only pointers that are exact leaves "
+                    "in at least one document; duplicates and paths that are "
+                    "non-leaf containers in both documents fail with a "
+                    "precise location."
+                ),
+                "operationId": "diff",
+                "requestBody": _json_content(
+                    _ref("DiffRequest"),
+                    example={
+                        "before": {
+                            "name": "Ada",
+                            "age": 36,
+                            "active": True,
+                            "tags": [],
+                            "removed": {"only": 1},
+                        },
+                        "after": {
+                            "name": "Ada",
+                            "age": 37,
+                            "active": False,
+                            "tags": [],
+                            "added": "yes",
+                        },
+                        "paths": ["/age", "/active", "/added", "/removed/only"],
+                    },
+                ),
+                "responses": {
+                    "200": {
+                        "description": "Stable, path-sorted leaf differences.",
+                        **_json_content(
+                            _ref("DiffResponse"),
+                            example={
+                                "added": [
+                                    {
+                                        "path": "/added",
+                                        "beforeValue": None,
+                                        "afterValue": "yes",
+                                        "beforeFingerprint": None,
+                                        "afterFingerprint": "ab" * 32,
+                                    }
+                                ],
+                                "removed": [
+                                    {
+                                        "path": "/removed/only",
+                                        "beforeValue": 1,
+                                        "afterValue": None,
+                                        "beforeFingerprint": "cd" * 32,
+                                        "afterFingerprint": None,
+                                    }
+                                ],
+                                "changed": [
+                                    {
+                                        "path": "/active",
+                                        "beforeValue": True,
+                                        "afterValue": False,
+                                        "beforeFingerprint": "ef" * 32,
+                                        "afterFingerprint": "01" * 32,
+                                    },
+                                    {
+                                        "path": "/age",
+                                        "beforeValue": 36,
+                                        "afterValue": 37,
+                                        "beforeFingerprint": "02" * 32,
+                                        "afterFingerprint": "03" * 32,
+                                    },
+                                ],
+                            },
+                        ),
                     },
                     **error_responses,
                 },

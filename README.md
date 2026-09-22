@@ -147,6 +147,29 @@ leaf_digest = SHA256(
 `422 ROOT_MISMATCH`。`/verify` 根据请求体**自动识别**两种格式：
 含 `proofNodes`/`leafCount` 即为紧凑格式，否则按标准格式逐叶验证。
 
+### 7. 叶级差异（`POST /diff`）
+
+`/diff` 对 `before`、`after` 两份文档分别执行同一套叶展开：标量、`null`、
+空对象 `{}`、空数组 `[]` 都是叶子，根标量/根空容器使用空指针 `""`。随后按
+RFC 6901 路径字符串排序并对齐两侧叶子：
+
+- 仅 `after` 有 → `added`；
+- 仅 `before` 有 → `removed`；
+- 两侧都有但**规范 JSON 字节不同** → `changed`（例如 `1` 与 `1.0`、
+  `true` 与 `1` 均视为不同）；
+- 每个条目包含 `path`、`beforeValue`、`afterValue`、
+  `beforeFingerprint`、`afterFingerprint`；
+- 缺失侧的值与指纹均为 JSON `null`；实际 JSON `null` 值不缺失，其指纹是
+  规范值 `null` 的 SHA-256；
+- 指纹为 `SHA256(canonical_value_bytes)` 的小写十六进制；
+- `added`、`removed`、`changed` 三个数组分别按 `path` 稳定排序。
+
+可选 `paths` 过滤器只接受两侧叶路径并集中的**精确叶路径**：路径在任一侧是叶即可
+（用于报告 added/removed；即使另一侧同一路径被替换成非空容器也允许）；若两侧都不是
+叶子，且在任一侧解析为非空容器，则返回 `PATH_NOT_LEAF`；两侧都不存在返回
+`PATH_NOT_FOUND`；重复项返回 `DUPLICATE_PATH`（`loc` 指向后出现的
+`paths[i]`）。省略 `paths` 比较所有叶；显式传 `[]` 表示不选择任何路径。
+
 ## API
 
 所有请求/响应均为 JSON。错误响应统一形如：
@@ -230,6 +253,85 @@ leaf_digest = SHA256(
 
 紧凑证明直接原样发给 `/verify`（不需要 `proofMode` 字段，服务自动识别）。
 
+### `POST /diff` — 叶级变更报告
+
+请求（`paths` 可省略；省略时比较两侧全部叶子的并集）：
+
+```json
+{
+  "before": {
+    "name": "Ada",
+    "age": 36,
+    "role": null,
+    "metadata": {},
+    "removed": "x"
+  },
+  "after": {
+    "name": "Ada",
+    "age": 37,
+    "role": "owner",
+    "metadata": {},
+    "added": []
+  },
+  "paths": ["/age", "/role", "/removed", "/added"]
+}
+```
+
+成功（`200`）：
+
+```json
+{
+  "added": [
+    {
+      "path": "/added",
+      "beforeValue": null,
+      "afterValue": [],
+      "beforeFingerprint": null,
+      "afterFingerprint": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    }
+  ],
+  "removed": [
+    {
+      "path": "/removed",
+      "beforeValue": "x",
+      "afterValue": null,
+      "beforeFingerprint": "ba2df4903a2c14e86dc3bcca58911b44ac1d2514b7227bf6eb08cfb978f55a1b",
+      "afterFingerprint": null
+    }
+  ],
+  "changed": [
+    {
+      "path": "/age",
+      "beforeValue": 36,
+      "afterValue": 37,
+      "beforeFingerprint": "76a50887d8f1c2e9301755428990ad81479ee21c25b43215cf524541e0503269",
+      "afterFingerprint": "7a61b53701befdae0eeeffaecc73f14e20b537bb0f8b91ad7c2936dc63562b25"
+    },
+    {
+      "path": "/role",
+      "beforeValue": null,
+      "afterValue": "owner",
+      "beforeFingerprint": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
+      "afterFingerprint": "622f06cbcd2e7e61637e17212e714e6c721d2dd5a9f7bc1aec911b65b34edcf5"
+    }
+  ]
+}
+```
+
+未选择的路径不会出现在结果中。空文档、空容器和根标量按叶规则处理：
+`{}` 与 `[]` 的根路径都是 `""`；空文档之间比较得到三个空数组。
+
+过滤器错误沿用统一错误体，例如提交非叶容器路径：
+
+```json
+{ "error": {
+    "code": "PATH_NOT_LEAF",
+    "message": "path '/subject' is a non-empty container in 'before'; paths must be exact leaf paths",
+    "loc": "paths[0]",
+    "detail": { "path": "/subject", "leafChildren": ["/subject/age", "/subject/name"] }
+} }
+```
+
 ### `POST /verify` — 无原文校验
 
 请求体只需提交方给你的根与所选披露：
@@ -303,7 +405,7 @@ leaf_digest = SHA256(
 | 400 | `INVALID_REQUEST` | 缺字段、类型错误 |
 | 400 | `POINTER_SYNTAX` | 指针非法（如尾随 `~`、不以 `/` 开头） |
 | 400 | `PATH_NOT_FOUND` | 文档中不存在该路径（含数组越界） |
-| 400 | `PATH_NOT_LEAF` | 路径是非空容器；`detail.leafChildren` 给出可选的叶路径 |
+| 400 | `PATH_NOT_LEAF` | 路径是非空容器（`/commit` 的 `reveal` 或 `/diff` 的 `paths`）；`detail.leafChildren` 给出可选的叶路径 |
 | 400 | `DUPLICATE_PATH` | 同一指针重复提交 |
 | 400 | `EMPTY_REVEAL` | 披露列表为空 |
 | 400 | `UNSUPPORTED_VALUE` | `NaN`/`Infinity`、孤立代理项等 |
@@ -315,6 +417,7 @@ leaf_digest = SHA256(
 ### 其他
 
 - `GET /healthz` → `{"status":"ok"}`
+- `POST /diff` → 叶级 added/removed/changed 变更报告
 - `GET /` → 服务与端点元信息
 - `GET /docs` / `GET /openapi.json` → OpenAPI 文档
 
@@ -333,7 +436,14 @@ curl -s localhost:8000/verify -H 'content-type: application/json' \
 
 # 3) 把值改成 37 再验证 → 422 ROOT_MISMATCH，loc=leaves[0]
 
-# 4) 紧凑多叶证明：加 "proofMode": "compact"，返回 leafCount、
+# 4) 报告两份文档的叶级差异；省略 paths 时比较所有叶子
+curl -s localhost:8000/diff -H 'content-type: application/json' -d '{
+  "before": {"subject": {"name": "Ada", "age": 36}},
+  "after": {"subject": {"name": "Ada", "age": 37, "added": null}},
+  "paths": ["/subject/age", "/subject/added"]
+}'
+
+# 5) 紧凑多叶证明：加 "proofMode": "compact"，返回 leafCount、
 #    每个叶的 index，以及按 (level,index) 去重的 proofNodes
 curl -s localhost:8000/commit -H 'content-type: application/json' -d '{
   "document": {"subject": {"name": "Ada", "age": 36}, "emails": ["a@x", "b@y"]},
@@ -348,7 +458,7 @@ curl -s localhost:8000/commit -H 'content-type: application/json' -d '{
 
 ```bash
 python3 -m pip install -r requirements-dev.txt
-python3 -m pytest -q          # 69 个测试
+python3 -m pytest -q          # 90+ 个测试
 python3 -m uvicorn app.main:app --reload --port 8000
 ```
 
@@ -356,7 +466,8 @@ python3 -m uvicorn app.main:app --reload --port 8000
 
 ```
 app/
-  main.py        # FastAPI 路由：/commit、/verify、错误处理
+  main.py        # FastAPI 路由：/commit、/verify、/diff、错误处理
+  diff.py        # 叶级路径对齐、规范值指纹与 added/removed/changed
   tree.py        # 叶展开、叶哈希/节点哈希、排序建树、标准与紧凑证明
   pointers.py    # RFC 6901 指针解析与寻址
   canonical.py   # 规范 JSON 序列化

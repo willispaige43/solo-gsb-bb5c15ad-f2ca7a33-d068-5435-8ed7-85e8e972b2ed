@@ -10,6 +10,8 @@ POST /commit   submit a nested JSON document plus the RFC 6901 paths that
 POST /verify   check disclosures against a previously committed root without
                ever seeing the original document; both proof formats are
                detected automatically.
+POST /diff     compare two documents at their RFC 6901 leaf paths and report
+               added, removed and changed canonical values.
 GET  /healthz  liveness probe.
 GET  /         service metadata.
 """
@@ -25,6 +27,7 @@ from fastapi.responses import JSONResponse
 
 from . import pointers
 from .canonical import CanonicalError
+from .diff import diff_documents
 from .errors import (
     ApiError,
     BAD_HASH_ENCODING,
@@ -71,7 +74,7 @@ _HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
 
 app = FastAPI(
     title="Selective JSON Disclosure",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "Commit a nested JSON document to a reproducible Merkle root and "
         "disclose individual RFC 6901 leaf facts with inclusion proofs.\n\n"
@@ -136,6 +139,124 @@ def _parse_hex32(value: Any, loc: str, what: str) -> bytes:
             loc=loc,
         )
     return bytes.fromhex(value)
+
+
+def _is_nonempty_container(value: Any) -> bool:
+    return isinstance(value, (dict, list)) and len(value) > 0
+
+
+def _leaf_children(leaves: set[str], pointer: str) -> list[str]:
+    prefix = pointer + "/" if pointer else "/"
+    return sorted(
+        child for child in leaves if child.startswith(prefix)
+    )[:20]
+
+
+def _validate_diff_paths(
+    paths: Any,
+    before: Any,
+    after: Any,
+    before_leaves: set[str],
+    after_leaves: set[str],
+) -> List[str]:
+    if not isinstance(paths, list):
+        raise ApiError(
+            INVALID_REQUEST,
+            "'paths' must be an array of exact RFC 6901 leaf pointer strings",
+            loc="paths",
+        )
+
+    selected: List[str] = []
+    seen: set[str] = set()
+    for i, requested in enumerate(paths):
+        loc = f"paths[{i}]"
+        if not isinstance(requested, str):
+            raise ApiError(
+                INVALID_REQUEST,
+                f"paths entry must be a pointer string, got "
+                f"{type(requested).__name__}",
+                loc=loc,
+            )
+
+        try:
+            tokens = pointers.parse_pointer(requested)
+        except pointers.PointerError as exc:
+            raise ApiError(POINTER_SYNTAX, str(exc), loc=loc) from exc
+
+        if requested in seen:
+            raise ApiError(
+                DUPLICATE_PATH,
+                f"path {requested!r} appears more than once in 'paths'",
+                loc=loc,
+                detail={"path": requested},
+            )
+        seen.add(requested)
+
+        is_before_leaf = requested in before_leaves
+        is_after_leaf = requested in after_leaves
+        # The filter is validated against the union leaf set, so a leaf on one
+        # side remains selectable even when the other side structurally
+        # replaces that same path with a non-empty container.
+        if is_before_leaf or is_after_leaf:
+            selected.append(requested)
+            continue
+
+        before_error: Exception | None = None
+        try:
+            before_value = pointers.resolve(before, tokens)
+        except (KeyError, IndexError, TypeError) as exc:
+            before_error = exc
+            before_is_container = False
+        else:
+            before_is_container = _is_nonempty_container(before_value)
+
+        after_error: Exception | None = None
+        try:
+            after_value = pointers.resolve(after, tokens)
+        except (KeyError, IndexError, TypeError) as exc:
+            after_error = exc
+            after_value = None
+            after_is_container = False
+        else:
+            after_is_container = _is_nonempty_container(after_value)
+
+        if before_is_container or after_is_container:
+            children: list[str] = []
+            if before_is_container:
+                children.extend(_leaf_children(before_leaves, requested))
+            if after_is_container:
+                children.extend(_leaf_children(after_leaves, requested))
+            sides = []
+            if before_is_container:
+                sides.append("'before'")
+            if after_is_container:
+                sides.append("'after'")
+            raise ApiError(
+                PATH_NOT_LEAF,
+                f"path {requested!r} is a non-empty container in "
+                f"{' and '.join(sides)}; paths must be exact leaf paths",
+                loc=loc,
+                detail={
+                    "path": requested,
+                    "leafChildren": sorted(set(children))[:20],
+                },
+            )
+
+        # The path is absent on both sides. The resolution errors provide the
+        # existing descriptive KeyError/IndexError/TypeError wording.
+        resolution_error = before_error or after_error
+        if resolution_error is not None:
+            raise ApiError(
+                PATH_NOT_FOUND,
+                f"path {requested!r} does not exist in either document: "
+                f"{resolution_error}",
+                loc=loc,
+                detail={"path": requested},
+            ) from resolution_error
+        # pragma: no cover - expansion includes every scalar/empty container
+        raise ApiError(PATH_NOT_FOUND, "path is not a leaf", loc=loc)
+
+    return selected
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +415,38 @@ async def commit(request: Request) -> Dict[str, Any]:
         )
 
     return {"root": root.hex(), "leaves": disclosed}
+
+
+# ---------------------------------------------------------------------------
+# POST /diff
+# ---------------------------------------------------------------------------
+
+
+@app.post("/diff")
+async def diff_documents_endpoint(request: Request) -> Dict[str, Any]:
+    body = await _read_json_body(request)
+    if not isinstance(body, dict):
+        raise ApiError(
+            INVALID_REQUEST,
+            "request body must be a JSON object",
+            loc="body",
+        )
+
+    before = _get_field(body, "before", "before")
+    validate_json_value(before, loc="before")
+    after = _get_field(body, "after", "after")
+    validate_json_value(after, loc="after")
+
+    before_leaf_set = {leaf.pointer for leaf in expand_leaves(before)}
+    after_leaf_set = {leaf.pointer for leaf in expand_leaves(after)}
+
+    selected_paths = None
+    if "paths" in body:
+        selected_paths = _validate_diff_paths(
+            body["paths"], before, after, before_leaf_set, after_leaf_set
+        )
+
+    return diff_documents(before, after, selected_paths)
 
 
 # ---------------------------------------------------------------------------
@@ -802,10 +955,11 @@ async def healthz() -> Dict[str, str]:
 async def index() -> Dict[str, Any]:
     return {
         "service": "selective-json-disclosure",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "endpoints": {
             "commit": "POST /commit",
             "verify": "POST /verify",
+            "diff": "POST /diff",
             "docs": "GET /docs",
             "health": "GET /healthz",
         },
